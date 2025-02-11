@@ -1,0 +1,4 @@
+all: MacroExpansionTool
+
+MacroExpansionTool: MacroExpansionTool.cpp
+	clang++ -std=c++17 MacroExpansionTool.cpp -o MacroExpansionTool   `llvm-config --cxxflags --ldflags --system-libs --libs all` -lclangTooling   -lclangFrontendTool   -lclangFrontend   -lclangSerialization   -lclangDriver   -lclangParse   -lclangSema   -lclangAnalysis   -lclangASTMatchers   -lclangAST   -lclangEdit   -lclangLex   -lclangBasic   -lclangToolingCore   -lclangAPINotes -lclangApplyReplacements -lclangTidyHICPPModule -lclangToolingRefactoring -lclangTidyZirconModule -lclangAnalysis -lclangTidyMain  -lclangTooling -lclangdSupport -lclangRewriteFrontend -lclangBasic  -lclangChangeNamespace -lclangTidyGoogleModule -lclangTidyConcurrencyModule  -lclangTidyModernizeModule -lclangSema -lclangLex -lclangFrontendTool -lclangToolingASTDiff -lclangHandleLLVM -lclangTidyUtils -lclangCodeGen -lclangSupport
