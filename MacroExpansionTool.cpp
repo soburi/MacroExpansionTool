@@ -49,8 +49,11 @@ struct MacroEvent {
 
 static bool gRecordTopLevelOnly = true;
 static vector<MacroEvent> gMacroEvents;
+// --line オプション。1-indexed で対象行を指定
 static cl::opt<unsigned> gTargetLine("line", cl::desc("Target line number (1-indexed)"), cl::Required);
 static cl::OptionCategory MacroToolCategory("macro-expansion-tool options");
+// 位置引数としてソースファイルを受け取る
+static cl::list<string> SourceFileList(cl::Positional, cl::desc("<source file>"), cl::OneOrMore);
 
 //===----------------------------------------------------------------------===//
 // ヘルパー関数
@@ -320,29 +323,42 @@ void dumpVirtualFile(const string &filename, IntrusiveRefCntPtr<llvm::vfs::FileS
 }
 
 int main(int argc, const char **argv) {
-  auto ExpectedParser = CommonOptionsParser::create(argc, argv, MacroToolCategory);
-  if (!ExpectedParser) {
-    auto Err = ExpectedParser.takeError();
-    errs() << "Error creating CommonOptionsParser: " << toString(std::move(Err)) << "\n";
-    return 1;
+  // まず、不要なオプションを除外するためにフィルタする
+  vector<const char*> filteredArgs;
+  filteredArgs.push_back(argv[0]);
+  for (int i = 1; i < argc; ++i) {
+    string arg = argv[i];
+    // --line オプションは保持、また、引数が "-" で始まらない場合は位置引数とみなす
+    if (arg.find("--line") == 0 || arg.empty() || arg[0] != '-')
+      filteredArgs.push_back(argv[i]);
+    // それ以外は無視する
   }
-  CommonOptionsParser &OptionsParser = *ExpectedParser;
-  auto SourceFiles = OptionsParser.getSourcePathList();
-  if (SourceFiles.empty()) {
+  cl::ParseCommandLineOptions(filteredArgs.size(), filteredArgs.data(), "Macro Expansion Tool\n");
+
+  if (SourceFileList.empty()) {
     errs() << "No source file specified!\n";
     return 1;
   }
-  string targetFileName = SourceFiles[0];
-  llvm::SmallVector<char, 128> absPath;
+
+  // 最後の位置引数をターゲットファイルとして使用
+  auto it = SourceFileList.end();
+  --it;
+  string targetFileName = *it;
+
+  // targetFileName を絶対パスに変換
+  SmallVector<char, 128> absPath;
   if (llvm::sys::fs::real_path(targetFileName, absPath)) {
     errs() << "Error resolving path for " << targetFileName << "\n";
     return 1;
   }
   targetFileName = std::string(absPath.data(), absPath.size());
 
+  // 追加オプション（例: -Xclang -detailed-preprocessing-record）
   vector<string> ExtraArgs = {"-Xclang", "-detailed-preprocessing-record"};
-  CommandLineArguments CLA(ExtraArgs.begin(), ExtraArgs.end());
+  // 固定コンパイル データベースを自前で作成
   FixedCompilationDatabase Compilations(".", vector<string>());
+  vector<string> SourceFiles;
+  SourceFiles.push_back(targetFileName);
 
   string fileContents = readFileContents(targetFileName);
   vector<string> lines = splitIntoLines(fileContents);
@@ -383,11 +399,9 @@ int main(int argc, const char **argv) {
 
     gMacroEvents.clear();
     gRecordTopLevelOnly = true;
-    ClangTool Tool(Compilations, OptionsParser.getSourcePathList());
+    ClangTool Tool(Compilations, SourceFiles);
     Tool.getFiles().setVirtualFileSystem(OverlayFS);
-    Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(CLA, ArgumentInsertPosition::BEGIN));
-
-    //dumpVirtualFile(targetFileName, OverlayFS);
+    Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(ExtraArgs, ArgumentInsertPosition::BEGIN));
 
     int result = Tool.run(newFrontendActionFactory<MacroExpansionAction>().get());
     (void)result;
