@@ -48,12 +48,6 @@ struct MacroEvent {
   string expansionText; // 展開結果のテキスト
 };
 
-struct LineEvent {
-  unsigned col;
-  unsigned len;
-  string expansion;
-};
-
 static vector<MacroEvent> gMacroEvents;
 static cl::opt<unsigned> gTargetLine("line", cl::desc("Target line number (1-indexed)"), cl::Required);
 static cl::OptionCategory MacroToolCategory("macro-expansion-tool options");
@@ -85,22 +79,6 @@ bool getLineFromFile(const string &filename, unsigned lineNum, string &outLine) 
       outLine = line;
       return true;
     }
-  }
-  return false;
-}
-
-bool getLineOffset(const string &filename, unsigned lineNum, unsigned &offset) {
-  ifstream ifs(filename);
-  if (!ifs)
-    return false;
-  offset = 0;
-  string line;
-  unsigned current = 0;
-  while (getline(ifs, line)) {
-    current++;
-    if (current == lineNum)
-      return true;
-    offset += line.size() + 1; // 改行を1文字としてカウント
   }
   return false;
 }
@@ -150,9 +128,13 @@ public:
       return;
     LangOptions LangOpts;
     string origText;
-    if (MD.getMacroInfo() && MD.getMacroInfo()->isFunctionLike())
+    if (MD.getMacroInfo() && MD.getMacroInfo()->isFunctionLike()) {
       origText = getFullMacroInvocationText(SM, MacroNameTok.getLocation(), LangOpts);
-    else {
+      string macroName = MacroNameTok.getIdentifierInfo()->getName().str();
+      // 既に展開済みなら、このイベントはスキップする
+      if (origText.find(macroName) != 0)
+        return;
+    } else {
       SourceLocation origBegin = Range.getBegin();
       SourceLocation origEnd = Lexer::getLocForEndOfToken(Range.getEnd(), 0, SM, LangOpts);
       origText = string(Lexer::getSourceText(CharSourceRange::getTokenRange(origBegin, origEnd), SM, LangOpts));
@@ -172,14 +154,17 @@ public:
     ev.expansionText = computedExpText;
     if (level == 0) {
       ev.originalOffset = SM.getFileOffset(Range.getBegin());
-      SourceLocation origEndLoc = Lexer::getLocForEndOfToken(Range.getEnd(), 0, SM, LangOpts);
-      ev.originalLength = SM.getFileOffset(origEndLoc) - ev.originalOffset;
+      if (MD.getMacroInfo() && MD.getMacroInfo()->isFunctionLike())
+        ev.originalLength = origText.size();
+      else {
+        SourceLocation origEndLoc = Lexer::getLocForEndOfToken(Range.getEnd(), 0, SM, LangOpts);
+        ev.originalLength = SM.getFileOffset(origEndLoc) - ev.originalOffset;
+      }
     } else {
       ev.originalOffset = 0;
       ev.originalLength = 0;
     }
     gMacroEvents.push_back(ev);
-    // （DEBUG 表示は省略可）
   }
 
 private:
@@ -189,105 +174,94 @@ private:
   unsigned TargetLine;
   bool printedOriginal;
 
-string getFullMacroInvocationText(SourceManager &SM, SourceLocation MacroNameLoc, const LangOptions &LangOpts) {
-  SourceLocation startLoc = SM.getSpellingLoc(MacroNameLoc);
-  bool invalid = false;
-  StringRef buffer = SM.getBufferData(SM.getFileID(startLoc), &invalid);
-  if (invalid)
-    return "";
-  unsigned offset = SM.getFileOffset(startLoc);
-  bool foundParen = false;
-  int parenCount = 0;
-  unsigned endOffset = offset;
-  for (unsigned i = offset, e = buffer.size(); i < e; i++) {
-    char c = buffer[i];
-    if (!foundParen) {
-      if (c == '(') {
-        foundParen = true;
-        parenCount = 1;
-      }
-    } else {
-      if (c == '(')
-        parenCount++;
-      else if (c == ')') {
-        parenCount--;
-        if (parenCount == 0) {
-          endOffset = i + 1;
-          break;
+  string getFullMacroInvocationText(SourceManager &SM, SourceLocation MacroNameLoc, const LangOptions &LangOpts) {
+    SourceLocation startLoc = SM.getSpellingLoc(MacroNameLoc);
+    bool invalid = false;
+    StringRef buffer = SM.getBufferData(SM.getFileID(startLoc), &invalid);
+    if (invalid)
+      return "";
+    unsigned offset = SM.getFileOffset(startLoc);
+    bool foundParen = false;
+    int parenCount = 0;
+    unsigned endOffset = offset;
+    for (unsigned i = offset, e = buffer.size(); i < e; i++) {
+      char c = buffer[i];
+      if (!foundParen) {
+        if (c == '(') {
+          foundParen = true;
+          parenCount = 1;
+        }
+      } else {
+        if (c == '(')
+          parenCount++;
+        else if (c == ')') {
+          parenCount--;
+          if (parenCount == 0) {
+            endOffset = i + 1;
+            break;
+          }
         }
       }
     }
+    return string(buffer.substr(offset, endOffset - offset));
   }
-  return string(buffer.substr(offset, endOffset - offset));
-}
-// ここで、Clang 18 の public API StringifyArgument を利用して実引数の文字列化を行う。
-// Signature: StringifyArgument(const Token *ArgToks, Preprocessor &PP, bool Charify,
-//                              SourceLocation ExpansionLocStart, SourceLocation ExpansionLocEnd)
-string computeMacroReplacement(const MacroDefinition &MD, const MacroArgs *Args,
+
+  string computeMacroReplacement(const MacroDefinition &MD, const MacroArgs *Args,
                                     SourceManager &SM, const LangOptions &LangOpts,
                                     Preprocessor &PP) {
-  const MacroInfo *MI = MD.getMacroInfo();
-  if (!MI)
-    return "";
-  string result;
-  if (!MI->isFunctionLike()) {
-    for (const auto &Tok : MI->tokens()) {
-      result += Lexer::getSpelling(Tok, SM, LangOpts);
-    }
-    return result;
-  }
-
-  auto &firsttok = MI->tokens()[0];
-  int processed = SM.getExpansionColumnNumber(SM.getExpansionLoc(firsttok.getLocation())); 
-
-  for (const auto &Tok : MI->tokens()) {
-    if (Tok.is(tok::identifier)) {
-      IdentifierInfo *II = Tok.getIdentifierInfo();
-      bool substituted = false;
-      for (auto It = MI->param_begin(), E = MI->param_end(); It != E; ++It) {
-        IdentifierInfo *ParamII = *It;
-        if (ParamII && (ParamII->getName() == II->getName())) {
-          unsigned paramIndex = static_cast<unsigned>(It - MI->param_begin());
-          // StringifyArgument を使って実引数の文字列を取得
-          // ExpansionLocStart/End は実引数の最初のトークンから算出する
-          const Token *ArgToks = Args->getUnexpArgument(paramIndex);
-          if (ArgToks) {
-            SourceLocation startLoc = SM.getExpansionLoc(ArgToks->getLocation());
-            SourceLocation endLoc = Lexer::getLocForEndOfToken(ArgToks->getLocation(), 0, SM, LangOpts);
-            string argStr = Lexer::getSourceText(CharSourceRange::getCharRange(startLoc, endLoc), SM, LangOpts).str();
-            processed += (SM.getExpansionColumnNumber(endLoc) - SM.getExpansionColumnNumber(startLoc));
-            result += argStr;
-            substituted = true;
-          }
-          break;
-        }
+    const MacroInfo *MI = MD.getMacroInfo();
+    if (!MI)
+      return "";
+    string result;
+    if (!MI->isFunctionLike()) {
+      for (const auto &Tok : MI->tokens()) {
+        result += Lexer::getSpelling(Tok, SM, LangOpts);
       }
-      if (!substituted) {
+      return result;
+    }
+    auto &firsttok = MI->tokens()[0];
+    int processed = SM.getExpansionColumnNumber(SM.getExpansionLoc(firsttok.getLocation()));
+    for (const auto &Tok : MI->tokens()) {
+      if (Tok.is(tok::identifier)) {
+        IdentifierInfo *II = Tok.getIdentifierInfo();
+        bool substituted = false;
+        for (auto It = MI->param_begin(), E = MI->param_end(); It != E; ++It) {
+          IdentifierInfo *ParamII = *It;
+          if (ParamII && (ParamII->getName() == II->getName())) {
+            unsigned paramIndex = static_cast<unsigned>(It - MI->param_begin());
+            const Token *ArgToks = Args->getUnexpArgument(paramIndex);
+            if (ArgToks) {
+              SourceLocation startLoc = SM.getExpansionLoc(ArgToks->getLocation());
+              SourceLocation endLoc = Lexer::getLocForEndOfToken(ArgToks->getLocation(), 0, SM, LangOpts);
+              string argStr = Lexer::getSourceText(CharSourceRange::getCharRange(startLoc, endLoc), SM, LangOpts).str();
+              processed += (SM.getExpansionColumnNumber(endLoc) - SM.getExpansionColumnNumber(startLoc));
+              result += argStr;
+              substituted = true;
+            }
+            break;
+          }
+        }
+        if (!substituted) {
+          SourceLocation startLoc = SM.getExpansionLoc(Tok.getLocation());
+          SourceLocation endLoc = Lexer::getLocForEndOfToken(Tok.getLocation(), 0, SM, LangOpts);
+          for (; processed < SM.getExpansionColumnNumber(startLoc); processed++) {
+            result += " ";
+          }
+          processed += (SM.getExpansionColumnNumber(endLoc) - SM.getExpansionColumnNumber(startLoc));
+          result += Lexer::getSpelling(Tok, SM, LangOpts);
+        }
+      } else {
         SourceLocation startLoc = SM.getExpansionLoc(Tok.getLocation());
         SourceLocation endLoc = Lexer::getLocForEndOfToken(Tok.getLocation(), 0, SM, LangOpts);
-      for (; processed < SM.getExpansionColumnNumber(startLoc); processed++) {
-        result += " ";
-      }
+        for (; processed < SM.getExpansionColumnNumber(startLoc); processed++) {
+          result += " ";
+        }
         processed += (SM.getExpansionColumnNumber(endLoc) - SM.getExpansionColumnNumber(startLoc));
         result += Lexer::getSpelling(Tok, SM, LangOpts);
       }
-    } else {
-      SourceLocation startLoc = SM.getExpansionLoc(Tok.getLocation());
-      SourceLocation endLoc = Lexer::getLocForEndOfToken(Tok.getLocation(), 0, SM, LangOpts);
-
-      for (; processed < SM.getExpansionColumnNumber(startLoc); processed++) {
-        result += " ";
-      }
-
-      processed += (SM.getExpansionColumnNumber(endLoc) - SM.getExpansionColumnNumber(startLoc));
-
-      result += Lexer::getSpelling(Tok, SM, LangOpts);
     }
+    return result;
   }
-  // 余分な空白があれば llvm::StringRef::trim() で除去
-  //result = StringRef(result).trim().str();
-  return result;
-}
 };
 
 class MacroExpansionAction : public PreprocessOnlyAction {
@@ -301,36 +275,51 @@ protected:
   }
 };
 
-string replaceMacrosInLine(const string &line, unsigned lineOffset, const vector<MacroEvent>& events) {
-    string newLine = line;
-    vector<LineEvent> lineEvents;
-
-    // 展開されたマクロのイベントを処理
+// 置換処理について
+// ここでは、元のテキスト（text）全体を先頭から順に走査し、事前に収集した置換イベント（replacements）
+// に基づいて、新しい文字列（result）を構築します。
+// 各 Replacement は、以下の情報を持ちます:
+//   pos: 元のテキスト内の開始位置（基準は baseOffset で補正済み）
+//   len: 置換対象の文字数
+//   expansion: 置換後に挿入すべき文字列
+//   origText: 置換対象として期待される原文（これと実際の部分文字列が一致する場合のみ置換を適用）
+string replaceMacrosInLine(const string &text, unsigned baseOffset, const vector<MacroEvent>& events) {
+    struct Replacement {
+      unsigned pos;
+      unsigned len;
+      string expansion;
+      string origText;
+    };
+    vector<Replacement> replacements;
     for (const auto &ev : events) {
-        if (ev.originalOffset >= lineOffset && ev.originalOffset < lineOffset + line.size()) {
-            unsigned col = ev.originalOffset - lineOffset;
-            lineEvents.push_back({col, ev.originalLength, ev.expansionText});
+        if (ev.originalLength == 0)
+            continue;
+        if (ev.originalOffset >= baseOffset && ev.originalOffset < baseOffset + text.size()) {
+            unsigned relPos = ev.originalOffset - baseOffset;
+            replacements.push_back({relPos, ev.originalLength, ev.expansionText, ev.originalText});
         }
     }
-
-    // イベントをソートして、後ろから前に向かって置き換えを行う
-    std::sort(lineEvents.begin(), lineEvents.end(), [](const LineEvent &a, const LineEvent &b) {
-        return a.col > b.col;
+    std::sort(replacements.begin(), replacements.end(), [](const Replacement &a, const Replacement &b) {
+        return a.pos < b.pos;
     });
-
-    for (const auto &le : lineEvents) {
-        if (le.col + le.len <= newLine.size()) {
-            string expanded = le.expansion;
-            size_t pos = 0;
-            // 元のソースに空白を挿入して置き換え
-            newLine.replace(le.col, le.len, expanded);
+    
+    string result;
+    size_t pos = 0;
+    for (const auto &rep : replacements) {
+        // まず、置換対象部分が、期待される原文と一致するかをチェックする
+        if (rep.pos + rep.len <= text.size() && text.substr(rep.pos, rep.len) == rep.origText) {
+            if (rep.pos > pos)
+                result.append(text, pos, rep.pos - pos);
+            result.append(rep.expansion);
+            pos = rep.pos + rep.len;
         }
     }
-
-    return newLine;
+    if (pos < text.size())
+        result.append(text, pos, text.size() - pos);
+    return result;
 }
 
-// InMemoryFileSystem を使ってファイルをメモリ上に展開するユーティリティ
+// InMemoryFileSystem を使って、ファイル内容をメモリ上に展開する
 IntrusiveRefCntPtr<llvm::vfs::InMemoryFileSystem> createInMemoryFSWithFile(const string &filename,
                                                                            const string &contents) {
   IntrusiveRefCntPtr<llvm::vfs::InMemoryFileSystem> InMemFS(new llvm::vfs::InMemoryFileSystem);
@@ -351,12 +340,10 @@ int main(int argc, const char **argv) {
     errs() << "No source file specified!\n";
     return 1;
   }
-  // targetFileName は、メインファイルの名前として使用
   string targetFileName = SourceFiles[0];
 
   vector<string> ExtraArgs = {"-Xclang", "-detailed-preprocessing-record"};
   CommandLineArguments CLA(ExtraArgs.begin(), ExtraArgs.end());
-
   FixedCompilationDatabase Compilations(".", vector<string>());
 
   string fileContents = readFileContents(targetFileName);
@@ -365,8 +352,25 @@ int main(int argc, const char **argv) {
     errs() << "Target line number is out of range.\n";
     return 1;
   }
-  string currentLine = lines[gTargetLine - 1];
-  outs() << "\nInitial target line: " << currentLine << "\n";
+  // 複数行にまたがる文の場合、末尾が ';' または '}' の行までを結合
+  unsigned stmtStart = gTargetLine - 1;
+  unsigned stmtEnd = stmtStart;
+  while (stmtEnd < lines.size()) {
+    string trimmed = lines[stmtEnd];
+    size_t endpos = trimmed.find_last_not_of(" \t\r\n");
+    if (endpos != string::npos)
+      trimmed = trimmed.substr(0, endpos + 1);
+    if (!trimmed.empty() && (trimmed.back() == ';' || trimmed.back() == '}'))
+      break;
+    stmtEnd++;
+  }
+  string currentStmt;
+  for (unsigned i = stmtStart; i <= stmtEnd && i < lines.size(); i++) {
+    currentStmt += lines[i];
+    if (i < stmtEnd)
+      currentStmt += "\n";
+  }
+  outs() << "\nInitial target statement: " << currentStmt << "\n";
 
   bool changed = true;
   int iteration = 0;
@@ -374,12 +378,13 @@ int main(int argc, const char **argv) {
 
   while (changed && iteration < maxIteration) {
     outs() << "\n--- Iteration " << iteration << " ---\n";
-    lines[gTargetLine - 1] = currentLine;
+    // ファイル内容の更新：対象文を currentStmt に置き換える
+    lines.erase(lines.begin() + stmtStart, lines.begin() + stmtEnd + 1);
+    lines.insert(lines.begin() + stmtStart, currentStmt);
     string updatedContents = joinLines(lines);
     auto MemFS = createInMemoryFSWithFile(targetFileName, updatedContents);
-
-    // OverlayFileSystem を利用して、実際のファイルシステムと重ね合わせる
-    IntrusiveRefCntPtr<llvm::vfs::OverlayFileSystem> OverlayFS(new llvm::vfs::OverlayFileSystem(llvm::vfs::getRealFileSystem()));
+    IntrusiveRefCntPtr<llvm::vfs::OverlayFileSystem> OverlayFS(
+         new llvm::vfs::OverlayFileSystem(llvm::vfs::getRealFileSystem()));
     OverlayFS->pushOverlay(MemFS);
 
     gMacroEvents.clear();
@@ -387,32 +392,33 @@ int main(int argc, const char **argv) {
     ClangTool Tool(Compilations, OptionsParser.getSourcePathList());
     Tool.getFiles().setVirtualFileSystem(OverlayFS);
     Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(CLA, ArgumentInsertPosition::BEGIN));
-
     int result = Tool.run(newFrontendActionFactory<MacroExpansionAction>().get());
     (void)result;
 
-    unsigned lineOffset = 0;
-    if (!getLineOffset(targetFileName, gTargetLine, lineOffset)) {
-      errs() << "Failed to get line offset from file!\n";
-      return 1;
+    // 更新後のファイルから、対象文の先頭までのオフセットを計算
+    unsigned stmtOffset = 0;
+    for (unsigned i = 0; i < stmtStart; i++) {
+      stmtOffset += lines[i].size() + 1;
     }
-
-    string newLine = replaceMacrosInLine(currentLine, lineOffset, gMacroEvents);
-    if (newLine == currentLine)
+    string newStmt = replaceMacrosInLine(currentStmt, stmtOffset, gMacroEvents);
+    if (newStmt == currentStmt)
       changed = false;
     else {
-      outs() << "Iteration " << iteration << " result: " << newLine << "\n";
-      currentLine = newLine;
+      outs() << "Iteration " << iteration << " result: " << newStmt << "\n";
+      currentStmt = newStmt;
       changed = true;
     }
     iteration++;
+    stmtEnd = stmtStart;
   }
 
   {
-    lines[gTargetLine - 1] = currentLine;
+    lines.erase(lines.begin() + stmtStart, lines.begin() + stmtEnd + 1);
+    lines.insert(lines.begin() + stmtStart, currentStmt);
     string updatedContents = joinLines(lines);
     auto MemFS = createInMemoryFSWithFile(targetFileName, updatedContents);
-    IntrusiveRefCntPtr<llvm::vfs::OverlayFileSystem> OverlayFS(new llvm::vfs::OverlayFileSystem(llvm::vfs::getRealFileSystem()));
+    IntrusiveRefCntPtr<llvm::vfs::OverlayFileSystem> OverlayFS(
+         new llvm::vfs::OverlayFileSystem(llvm::vfs::getRealFileSystem()));
     OverlayFS->pushOverlay(MemFS);
     gMacroEvents.clear();
     gRecordTopLevelOnly = false;
@@ -421,16 +427,14 @@ int main(int argc, const char **argv) {
     Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(CLA, ArgumentInsertPosition::BEGIN));
     int result = Tool.run(newFrontendActionFactory<MacroExpansionAction>().get());
     (void)result;
-    unsigned lineOffset = 0;
-    if (!getLineOffset(targetFileName, gTargetLine, lineOffset)) {
-      errs() << "Failed to get line offset from file (Pass2)!\n";
-      return 1;
+    unsigned stmtOffset = 0;
+    for (unsigned i = 0; i < stmtStart; i++) {
+      stmtOffset += lines[i].size() + 1;
     }
-    string finalLine = replaceMacrosInLine(currentLine, lineOffset, gMacroEvents);
-    outs() << "\nFinal expanded line: " << finalLine << "\n";
+    string finalStmt = replaceMacrosInLine(currentStmt, stmtOffset, gMacroEvents);
+    outs() << "\nFinal expanded statement: " << finalStmt << "\n";
   }
 
   return 0;
 }
-
 
