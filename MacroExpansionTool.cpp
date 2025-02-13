@@ -40,12 +40,12 @@ using namespace std;
 //===----------------------------------------------------------------------===//
 
 struct MacroEvent {
-  unsigned level;         // 0:トップレベル、1:入れ子など
-  unsigned originalOffset;  // （トップレベル用）元のファイル内でのオフセット
-  unsigned originalLength;  // （トップレベル用）
+  unsigned level;         // 1:トップレベルの展開、2以上:入れ子
+  unsigned originalOffset;  // 元のファイル内でのオフセット
+  unsigned originalLength;  // 置換対象の長さ
   string macroName;
   string originalText;  // マクロ呼び出し時のテキスト
-  string expansionText; // 展開結果のテキスト
+  string expansionText; // 展開結果の文字列
 };
 
 static vector<MacroEvent> gMacroEvents;
@@ -60,8 +60,10 @@ static bool gRecordTopLevelOnly = true;
 
 unsigned computeNestingLevel(SourceManager &SM, SourceLocation Loc) {
   unsigned level = 0;
+  errs() << "level: " << level << "\n";
   while (Loc.isMacroID()) {
     level++;
+    errs() << "level: " << level << "\n";
     Loc = SM.getImmediateSpellingLoc(Loc);
   }
   return level;
@@ -124,21 +126,20 @@ public:
     if (file != TargetFile || line != TargetLine)
       return;
     unsigned level = computeNestingLevel(SM, MacroNameTok.getLocation());
+    errs() << "level = " << level << "\n";
+    // 修正：トップレベルの展開はレベル1であるため、レベルが1でない場合は無視する
     if (gRecordTopLevelOnly && level != 0)
       return;
     LangOptions LangOpts;
     string origText;
     if (MD.getMacroInfo() && MD.getMacroInfo()->isFunctionLike()) {
       origText = getFullMacroInvocationText(SM, MacroNameTok.getLocation(), LangOpts);
-      string macroName = MacroNameTok.getIdentifierInfo()->getName().str();
-      // 既に展開済みなら、このイベントはスキップする
-      if (origText.find(macroName) != 0)
-        return;
     } else {
       SourceLocation origBegin = Range.getBegin();
       SourceLocation origEnd = Lexer::getLocForEndOfToken(Range.getEnd(), 0, SM, LangOpts);
       origText = string(Lexer::getSourceText(CharSourceRange::getTokenRange(origBegin, origEnd), SM, LangOpts));
     }
+    errs() << origText << "\n";
     string computedExpText;
     if (MD.getMacroInfo() && MD.getMacroInfo()->isFunctionLike() && Args)
       computedExpText = computeMacroReplacement(MD, Args, SM, LangOpts, PP);
@@ -207,8 +208,8 @@ private:
   }
 
   string computeMacroReplacement(const MacroDefinition &MD, const MacroArgs *Args,
-                                    SourceManager &SM, const LangOptions &LangOpts,
-                                    Preprocessor &PP) {
+                                 SourceManager &SM, const LangOptions &LangOpts,
+                                 Preprocessor &PP) {
     const MacroInfo *MI = MD.getMacroInfo();
     if (!MI)
       return "";
@@ -275,14 +276,7 @@ protected:
   }
 };
 
-// 置換処理について
-// ここでは、元のテキスト（text）全体を先頭から順に走査し、事前に収集した置換イベント（replacements）
-// に基づいて、新しい文字列（result）を構築します。
-// 各 Replacement は、以下の情報を持ちます:
-//   pos: 元のテキスト内の開始位置（基準は baseOffset で補正済み）
-//   len: 置換対象の文字数
-//   expansion: 置換後に挿入すべき文字列
-//   origText: 置換対象として期待される原文（これと実際の部分文字列が一致する場合のみ置換を適用）
+// 置換処理: ファイル内の対象テキスト(text)の baseOffset 以降に記録されたイベントに基づいて置換を行う
 string replaceMacrosInLine(const string &text, unsigned baseOffset, const vector<MacroEvent>& events) {
     struct Replacement {
       unsigned pos;
@@ -306,7 +300,6 @@ string replaceMacrosInLine(const string &text, unsigned baseOffset, const vector
     string result;
     size_t pos = 0;
     for (const auto &rep : replacements) {
-        // まず、置換対象部分が、期待される原文と一致するかをチェックする
         if (rep.pos + rep.len <= text.size() && text.substr(rep.pos, rep.len) == rep.origText) {
             if (rep.pos > pos)
                 result.append(text, pos, rep.pos - pos);
@@ -319,7 +312,6 @@ string replaceMacrosInLine(const string &text, unsigned baseOffset, const vector
     return result;
 }
 
-// InMemoryFileSystem を使って、ファイル内容をメモリ上に展開する
 IntrusiveRefCntPtr<llvm::vfs::InMemoryFileSystem> createInMemoryFSWithFile(const string &filename,
                                                                            const string &contents) {
   IntrusiveRefCntPtr<llvm::vfs::InMemoryFileSystem> InMemFS(new llvm::vfs::InMemoryFileSystem);
@@ -327,6 +319,28 @@ IntrusiveRefCntPtr<llvm::vfs::InMemoryFileSystem> createInMemoryFSWithFile(const
   return InMemFS;
 }
 
+void dumpVirtualFile(const string &filename, IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS) {
+  // ファイルのステータスを取得してサイズを表示
+  auto StatusOrError = FS->status(filename);
+  if (!StatusOrError) {
+    errs() << "Error reading file status from virtual FS: " 
+           << StatusOrError.getError().message() << "\n";
+    return;
+  }
+  auto Status = *StatusOrError;
+  outs() << "Dump of virtual file (" << filename << "):\n";
+  outs() << "Size: " << Status.getSize() << " bytes\n";
+  
+  // ファイル内容を取得して表示
+  auto BufferOrError = FS->getBufferForFile(filename);
+  if (!BufferOrError) {
+    errs() << "Error reading file from virtual FS: " 
+           << BufferOrError.getError().message() << "\n";
+    return;
+  }
+  auto &Buffer = *BufferOrError;
+  outs() << Buffer->getBuffer() << "\n";
+}
 int main(int argc, const char **argv) {
   auto ExpectedParser = CommonOptionsParser::create(argc, argv, MacroToolCategory);
   if (!ExpectedParser) {
@@ -341,6 +355,12 @@ int main(int argc, const char **argv) {
     return 1;
   }
   string targetFileName = SourceFiles[0];
+llvm::SmallVector<char, 128> absPath;
+if (llvm::sys::fs::real_path(targetFileName, absPath)) {
+  errs() << "Error resolving path for " << targetFileName << "\n";
+  return 1;
+}
+targetFileName = std::string(absPath.data(), absPath.size());
 
   vector<string> ExtraArgs = {"-Xclang", "-detailed-preprocessing-record"};
   CommandLineArguments CLA(ExtraArgs.begin(), ExtraArgs.end());
@@ -352,7 +372,6 @@ int main(int argc, const char **argv) {
     errs() << "Target line number is out of range.\n";
     return 1;
   }
-  // 複数行にまたがる文の場合、末尾が ';' または '}' の行までを結合
   unsigned stmtStart = gTargetLine - 1;
   unsigned stmtEnd = stmtStart;
   while (stmtEnd < lines.size()) {
@@ -378,24 +397,30 @@ int main(int argc, const char **argv) {
 
   while (changed && iteration < maxIteration) {
     outs() << "\n--- Iteration " << iteration << " ---\n";
-    // ファイル内容の更新：対象文を currentStmt に置き換える
+    errs() << currentStmt << "\n";
     lines.erase(lines.begin() + stmtStart, lines.begin() + stmtEnd + 1);
     lines.insert(lines.begin() + stmtStart, currentStmt);
     string updatedContents = joinLines(lines);
+    errs() << "updatedContents:\n";
+    errs() << updatedContents;
     auto MemFS = createInMemoryFSWithFile(targetFileName, updatedContents);
-    IntrusiveRefCntPtr<llvm::vfs::OverlayFileSystem> OverlayFS(
-         new llvm::vfs::OverlayFileSystem(llvm::vfs::getRealFileSystem()));
+    IntrusiveRefCntPtr<llvm::vfs::OverlayFileSystem> OverlayFS(new llvm::vfs::OverlayFileSystem(llvm::vfs::getRealFileSystem()));
     OverlayFS->pushOverlay(MemFS);
 
     gMacroEvents.clear();
     gRecordTopLevelOnly = true;
     ClangTool Tool(Compilations, OptionsParser.getSourcePathList());
     Tool.getFiles().setVirtualFileSystem(OverlayFS);
+    // キャッシュをクリアして最新内容を反映
+    Tool.getFiles().clearStatCache();
     Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(CLA, ArgumentInsertPosition::BEGIN));
+
+    dumpVirtualFile(targetFileName, OverlayFS);
+
+    errs() << "Tool.run\n";
     int result = Tool.run(newFrontendActionFactory<MacroExpansionAction>().get());
     (void)result;
 
-    // 更新後のファイルから、対象文の先頭までのオフセットを計算
     unsigned stmtOffset = 0;
     for (unsigned i = 0; i < stmtStart; i++) {
       stmtOffset += lines[i].size() + 1;
@@ -411,7 +436,7 @@ int main(int argc, const char **argv) {
     iteration++;
     stmtEnd = stmtStart;
   }
-
+/*
   {
     lines.erase(lines.begin() + stmtStart, lines.begin() + stmtEnd + 1);
     lines.insert(lines.begin() + stmtStart, currentStmt);
@@ -424,6 +449,7 @@ int main(int argc, const char **argv) {
     gRecordTopLevelOnly = false;
     ClangTool Tool(Compilations, OptionsParser.getSourcePathList());
     Tool.getFiles().setVirtualFileSystem(OverlayFS);
+    Tool.getFiles().clearStatCache();
     Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(CLA, ArgumentInsertPosition::BEGIN));
     int result = Tool.run(newFrontendActionFactory<MacroExpansionAction>().get());
     (void)result;
@@ -434,7 +460,7 @@ int main(int argc, const char **argv) {
     string finalStmt = replaceMacrosInLine(currentStmt, stmtOffset, gMacroEvents);
     outs() << "\nFinal expanded statement: " << finalStmt << "\n";
   }
-
+*/
   return 0;
 }
 
