@@ -3,7 +3,6 @@
 #include "clang/Basic/LangOptions.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Frontend/CompilerInstance.h"
-// PreprocessOnlyAction は FrontendActions.h 内に定義されています
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/PPCallbacks.h"
@@ -48,40 +47,14 @@ struct MacroEvent {
   string expansionText; // 展開結果の文字列
 };
 
+static bool gRecordTopLevelOnly = true;
 static vector<MacroEvent> gMacroEvents;
 static cl::opt<unsigned> gTargetLine("line", cl::desc("Target line number (1-indexed)"), cl::Required);
 static cl::OptionCategory MacroToolCategory("macro-expansion-tool options");
 
-static bool gRecordTopLevelOnly = true;
-
 //===----------------------------------------------------------------------===//
 // ヘルパー関数
 //===----------------------------------------------------------------------===//
-
-unsigned computeNestingLevel(SourceManager &SM, SourceLocation Loc) {
-  unsigned level = 0;
-  while (Loc.isMacroID()) {
-    level++;
-    Loc = SM.getImmediateSpellingLoc(Loc);
-  }
-  return level;
-}
-
-bool getLineFromFile(const string &filename, unsigned lineNum, string &outLine) {
-  ifstream ifs(filename);
-  if (!ifs)
-    return false;
-  string line;
-  unsigned current = 0;
-  while (getline(ifs, line)) {
-    current++;
-    if (current == lineNum) {
-      outLine = line;
-      return true;
-    }
-  }
-  return false;
-}
 
 string readFileContents(const string &filename) {
   ifstream ifs(filename);
@@ -123,7 +96,7 @@ public:
     unsigned line = SM.getExpansionLineNumber(expansionLoc);
     if (file != TargetFile || line != TargetLine)
       return;
-    unsigned level = computeNestingLevel(SM, MacroNameTok.getLocation());
+    unsigned level = computeNestingLevel(MacroNameTok.getLocation());
     if (gRecordTopLevelOnly && level != 0)
       return;
     LangOptions LangOpts;
@@ -169,6 +142,15 @@ private:
   string TargetFile;
   unsigned TargetLine;
   bool printedOriginal;
+
+  unsigned computeNestingLevel(SourceLocation Loc) {
+    unsigned level = 0;
+    while (Loc.isMacroID()) {
+      level++;
+      Loc = SM.getImmediateSpellingLoc(Loc);
+    }
+    return level;
+  }
 
   string getFullMacroInvocationText(SourceManager &SM, SourceLocation MacroNameLoc, const LangOptions &LangOpts) {
     SourceLocation startLoc = SM.getSpellingLoc(MacroNameLoc);
@@ -336,6 +318,7 @@ void dumpVirtualFile(const string &filename, IntrusiveRefCntPtr<llvm::vfs::FileS
   auto &Buffer = *BufferOrError;
   outs() << Buffer->getBuffer() << "\n";
 }
+
 int main(int argc, const char **argv) {
   auto ExpectedParser = CommonOptionsParser::create(argc, argv, MacroToolCategory);
   if (!ExpectedParser) {
@@ -402,8 +385,6 @@ int main(int argc, const char **argv) {
     gRecordTopLevelOnly = true;
     ClangTool Tool(Compilations, OptionsParser.getSourcePathList());
     Tool.getFiles().setVirtualFileSystem(OverlayFS);
-    // キャッシュをクリアして最新内容を反映
-    Tool.getFiles().clearStatCache();
     Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(CLA, ArgumentInsertPosition::BEGIN));
 
     //dumpVirtualFile(targetFileName, OverlayFS);
@@ -426,31 +407,6 @@ int main(int argc, const char **argv) {
     iteration++;
     stmtEnd = stmtStart;
   }
-/*
-  {
-    lines.erase(lines.begin() + stmtStart, lines.begin() + stmtEnd + 1);
-    lines.insert(lines.begin() + stmtStart, currentStmt);
-    string updatedContents = joinLines(lines);
-    auto MemFS = createInMemoryFSWithFile(targetFileName, updatedContents);
-    IntrusiveRefCntPtr<llvm::vfs::OverlayFileSystem> OverlayFS(
-         new llvm::vfs::OverlayFileSystem(llvm::vfs::getRealFileSystem()));
-    OverlayFS->pushOverlay(MemFS);
-    gMacroEvents.clear();
-    gRecordTopLevelOnly = false;
-    ClangTool Tool(Compilations, OptionsParser.getSourcePathList());
-    Tool.getFiles().setVirtualFileSystem(OverlayFS);
-    Tool.getFiles().clearStatCache();
-    Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(CLA, ArgumentInsertPosition::BEGIN));
-    int result = Tool.run(newFrontendActionFactory<MacroExpansionAction>().get());
-    (void)result;
-    unsigned stmtOffset = 0;
-    for (unsigned i = 0; i < stmtStart; i++) {
-      stmtOffset += lines[i].size() + 1;
-    }
-    string finalStmt = replaceMacrosInLine(currentStmt, stmtOffset, gMacroEvents);
-    outs() << "\nFinal expanded statement: " << finalStmt << "\n";
-  }
-*/
   return 0;
 }
 
