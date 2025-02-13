@@ -60,10 +60,8 @@ static bool gRecordTopLevelOnly = true;
 
 unsigned computeNestingLevel(SourceManager &SM, SourceLocation Loc) {
   unsigned level = 0;
-  errs() << "level: " << level << "\n";
   while (Loc.isMacroID()) {
     level++;
-    errs() << "level: " << level << "\n";
     Loc = SM.getImmediateSpellingLoc(Loc);
   }
   return level;
@@ -126,8 +124,6 @@ public:
     if (file != TargetFile || line != TargetLine)
       return;
     unsigned level = computeNestingLevel(SM, MacroNameTok.getLocation());
-    errs() << "level = " << level << "\n";
-    // 修正：トップレベルの展開はレベル1であるため、レベルが1でない場合は無視する
     if (gRecordTopLevelOnly && level != 0)
       return;
     LangOptions LangOpts;
@@ -139,7 +135,6 @@ public:
       SourceLocation origEnd = Lexer::getLocForEndOfToken(Range.getEnd(), 0, SM, LangOpts);
       origText = string(Lexer::getSourceText(CharSourceRange::getTokenRange(origBegin, origEnd), SM, LangOpts));
     }
-    errs() << origText << "\n";
     string computedExpText;
     if (MD.getMacroInfo() && MD.getMacroInfo()->isFunctionLike() && Args)
       computedExpText = computeMacroReplacement(MD, Args, SM, LangOpts, PP);
@@ -355,12 +350,12 @@ int main(int argc, const char **argv) {
     return 1;
   }
   string targetFileName = SourceFiles[0];
-llvm::SmallVector<char, 128> absPath;
-if (llvm::sys::fs::real_path(targetFileName, absPath)) {
-  errs() << "Error resolving path for " << targetFileName << "\n";
-  return 1;
-}
-targetFileName = std::string(absPath.data(), absPath.size());
+  llvm::SmallVector<char, 128> absPath;
+  if (llvm::sys::fs::real_path(targetFileName, absPath)) {
+    errs() << "Error resolving path for " << targetFileName << "\n";
+    return 1;
+  }
+  targetFileName = std::string(absPath.data(), absPath.size());
 
   vector<string> ExtraArgs = {"-Xclang", "-detailed-preprocessing-record"};
   CommandLineArguments CLA(ExtraArgs.begin(), ExtraArgs.end());
@@ -396,13 +391,9 @@ targetFileName = std::string(absPath.data(), absPath.size());
   const int maxIteration = 10;
 
   while (changed && iteration < maxIteration) {
-    outs() << "\n--- Iteration " << iteration << " ---\n";
-    errs() << currentStmt << "\n";
     lines.erase(lines.begin() + stmtStart, lines.begin() + stmtEnd + 1);
     lines.insert(lines.begin() + stmtStart, currentStmt);
     string updatedContents = joinLines(lines);
-    errs() << "updatedContents:\n";
-    errs() << updatedContents;
     auto MemFS = createInMemoryFSWithFile(targetFileName, updatedContents);
     IntrusiveRefCntPtr<llvm::vfs::OverlayFileSystem> OverlayFS(new llvm::vfs::OverlayFileSystem(llvm::vfs::getRealFileSystem()));
     OverlayFS->pushOverlay(MemFS);
@@ -415,9 +406,8 @@ targetFileName = std::string(absPath.data(), absPath.size());
     Tool.getFiles().clearStatCache();
     Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(CLA, ArgumentInsertPosition::BEGIN));
 
-    dumpVirtualFile(targetFileName, OverlayFS);
+    //dumpVirtualFile(targetFileName, OverlayFS);
 
-    errs() << "Tool.run\n";
     int result = Tool.run(newFrontendActionFactory<MacroExpansionAction>().get());
     (void)result;
 
@@ -429,7 +419,7 @@ targetFileName = std::string(absPath.data(), absPath.size());
     if (newStmt == currentStmt)
       changed = false;
     else {
-      outs() << "Iteration " << iteration << " result: " << newStmt << "\n";
+      outs() << "Iteration " << iteration << ": " << newStmt << "\n";
       currentStmt = newStmt;
       changed = true;
     }
