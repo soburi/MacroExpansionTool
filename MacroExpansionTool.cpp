@@ -300,7 +300,6 @@ IntrusiveRefCntPtr<llvm::vfs::InMemoryFileSystem> createInMemoryFSWithFile(const
 }
 
 void dumpVirtualFile(const string &filename, IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS) {
-  // ファイルのステータスを取得してサイズを表示
   auto StatusOrError = FS->status(filename);
   if (!StatusOrError) {
     errs() << "Error reading file status from virtual FS: " 
@@ -310,8 +309,6 @@ void dumpVirtualFile(const string &filename, IntrusiveRefCntPtr<llvm::vfs::FileS
   auto Status = *StatusOrError;
   outs() << "Dump of virtual file (" << filename << "):\n";
   outs() << "Size: " << Status.getSize() << " bytes\n";
-  
-  // ファイル内容を取得して表示
   auto BufferOrError = FS->getBufferForFile(filename);
   if (!BufferOrError) {
     errs() << "Error reading file from virtual FS: " 
@@ -323,24 +320,49 @@ void dumpVirtualFile(const string &filename, IntrusiveRefCntPtr<llvm::vfs::FileS
 }
 
 int main(int argc, const char **argv) {
-  // まず、不要なオプションを除外するためにフィルタする
+  // フィルタ済み引数を保持するコンテナと、コンパイルデータベースに渡すオプションを集めるためのコンテナ
   vector<const char*> filteredArgs;
-  filteredArgs.push_back(argv[0]);
+  vector<string> compdbArgs; // -I などのオプションを保持
+
   for (int i = 1; i < argc; ++i) {
     string arg = argv[i];
-    // --line オプションは保持、また、引数が "-" で始まらない場合は位置引数とみなす
-    if (arg.find("--line") == 0 || arg.empty() || arg[0] != '-')
+    // --line オプションやソースファイルはそのまま追加
+    if (arg.find("--line") == 0 || arg.empty() || arg[0] != '-') {
       filteredArgs.push_back(argv[i]);
-    // それ以外は無視する
+    } else if (arg.substr(0,2) == "-I" || arg.substr(0,2) == "-D" ||
+               arg.substr(0,2) == "-U" || arg.substr(0,8) == "-isystem" ||
+               arg.substr(0,8) == "-include") {
+      filteredArgs.push_back(argv[i]);
+      // -Iオプションの場合、引数に連結されているか別トークンかをチェックして両方を compdbArgs に追加
+      if (arg.substr(0,2) == "-I") {
+        compdbArgs.push_back(arg);
+        if (arg == "-I" && i + 1 < argc) {
+          filteredArgs.push_back(argv[++i]);
+          compdbArgs.push_back(argv[i]);
+        }
+      }
+      // -D, -U, -isystem, -include なども必要なら compdbArgs に追加する
+      else {
+        compdbArgs.push_back(arg);
+        if ((arg == "-D" || arg == "-U" || arg == "-isystem" || arg == "-include") && (i + 1 < argc)) {
+          filteredArgs.push_back(argv[++i]);
+          compdbArgs.push_back(argv[i]);
+        }
+      }
+    }
+    // それ以外のオプションは無視
   }
+
+  // FixedCompilationDatabaseに-Iなどのオプションを反映
+  FixedCompilationDatabase Compilations(".", compdbArgs);
+
   cl::ParseCommandLineOptions(filteredArgs.size(), filteredArgs.data(), "Macro Expansion Tool\n");
 
   if (SourceFileList.empty()) {
     errs() << "No source file specified!\n";
     return 1;
   }
-
-  // 最後の位置引数をターゲットファイルとして使用
+  // 位置引数の最後のものをターゲットファイルとして使用
   auto it = SourceFileList.end();
   --it;
   string targetFileName = *it;
@@ -355,8 +377,6 @@ int main(int argc, const char **argv) {
 
   // 追加オプション（例: -Xclang -detailed-preprocessing-record）
   vector<string> ExtraArgs = {"-Xclang", "-detailed-preprocessing-record"};
-  // 固定コンパイル データベースを自前で作成
-  FixedCompilationDatabase Compilations(".", vector<string>());
   vector<string> SourceFiles;
   SourceFiles.push_back(targetFileName);
 
@@ -404,7 +424,9 @@ int main(int argc, const char **argv) {
     Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(ExtraArgs, ArgumentInsertPosition::BEGIN));
 
     int result = Tool.run(newFrontendActionFactory<MacroExpansionAction>().get());
-    (void)result;
+    if (result) {
+      return result;
+    }
 
     unsigned stmtOffset = 0;
     for (unsigned i = 0; i < stmtStart; i++) {
