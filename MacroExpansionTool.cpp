@@ -324,17 +324,22 @@ int main(int argc, const char **argv) {
   vector<const char*> filteredArgs;
   vector<string> compdbArgs; // -I などのオプションを保持
 
-  for (int i = 1; i < argc; ++i) {
+  filteredArgs.push_back(argv[0]);
+
+  for (int i = 1; i < argc; i++) {
     string arg = argv[i];
     // --line オプションやソースファイルはそのまま追加
-    if (arg.find("--line") == 0 || arg.empty() || arg[0] != '-') {
+    if (arg.find("--line=") == 0 || arg.empty() || arg[0] != '-') {
       filteredArgs.push_back(argv[i]);
+    } else if (arg.find("--line") == 0) {
+      filteredArgs.push_back(argv[i]);
+      filteredArgs.push_back(argv[++i]);
     } else if (arg.substr(0,2) == "-I" || arg.substr(0,2) == "-D" ||
                arg.substr(0,2) == "-U" || arg.substr(0,8) == "-isystem" ||
                arg.substr(0,8) == "-include") {
-      filteredArgs.push_back(argv[i]);
       // -Iオプションの場合、引数に連結されているか別トークンかをチェックして両方を compdbArgs に追加
       if (arg.substr(0,2) == "-I") {
+        filteredArgs.push_back(argv[i]);
         compdbArgs.push_back(arg);
         if (arg == "-I" && i + 1 < argc) {
           filteredArgs.push_back(argv[++i]);
@@ -344,8 +349,8 @@ int main(int argc, const char **argv) {
       // -D, -U, -isystem, -include なども必要なら compdbArgs に追加する
       else {
         compdbArgs.push_back(arg);
-        if ((arg == "-D" || arg == "-U" || arg == "-isystem" || arg == "-include") && (i + 1 < argc)) {
-          filteredArgs.push_back(argv[++i]);
+        if ((arg.substr(0, 2) == "-D" || arg == "-U" || arg == "-isystem" || arg == "-include") && (i + 1 < argc)) {
+          filteredArgs.push_back(argv[i]);
           compdbArgs.push_back(argv[i]);
         }
       }
